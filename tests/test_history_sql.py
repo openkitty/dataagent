@@ -31,6 +31,9 @@ CorpusDownloadError = downloader.CorpusDownloadError
 compare_corpora = downloader.compare_corpora
 fetch_all_entities = downloader.fetch_all_entities
 write_corpus = downloader.write_corpus
+_unwrap_jsonb = downloader._unwrap_jsonb
+_is_verified_sql = downloader._is_verified_sql
+_verified_state = downloader._verified_state
 
 
 def entity(guid="one", table="db.demo", sql="SELECT 1", **attributes):
@@ -422,3 +425,187 @@ def test_nl2sql_receives_reference_only_for_the_explicit_task(tmp_path):
     assert "history_sql_reference" not in json.loads(result["evidence"])
     records = [json.loads(p.read_text()) for p in (ctx.session.outputs / "metadata").glob("*.json")]
     assert [record["kind"] for record in records] == ["schema"]
+
+
+def _wrapper(payload):
+    return {"type": "jsonb", "value": json.dumps(payload), "null": False}
+
+
+def test_unwrap_jsonb_handles_pgobject_wrapper_and_passthrough_forms():
+    assert _unwrap_jsonb(_wrapper({"is_verified": True})) == {"is_verified": True}
+    plain = {"is_verified": True}
+    assert _unwrap_jsonb(plain) is plain
+    extra = {"type": "jsonb", "value": "x", "null": False, "extra": 1}
+    assert _unwrap_jsonb(extra) is extra
+    assert _unwrap_jsonb(json.dumps({"a": 1})) == {"a": 1}
+    assert _unwrap_jsonb(json.dumps([1])) is None
+    assert _unwrap_jsonb("not json") is None
+    assert _unwrap_jsonb({"type": "jsonb", "value": "not json", "null": False}) is None
+    assert _unwrap_jsonb({"type": "jsonb", "value": None, "null": True}) is None
+    assert _unwrap_jsonb(None) is None
+    assert _unwrap_jsonb(123) is None
+
+
+def test_is_verified_sql_accepts_boolean_or_case_insensitive_true_string():
+    def with_props(props):
+        return entity("g", sql="SELECT 1", sql_process_properties=props)
+
+    assert _is_verified_sql(with_props(_wrapper({"is_verified": True})))
+    assert _is_verified_sql(with_props({"is_verified": True}))
+    assert _is_verified_sql(with_props({"is_verified": " TRUE "}))
+    assert not _is_verified_sql(with_props(_wrapper({"is_verified": False})))
+    assert not _is_verified_sql(with_props({"is_verified": "false"}))
+    assert not _is_verified_sql(with_props({"is_verified": "1"}))
+    assert not _is_verified_sql(with_props({"other_key": True}))
+    assert not _is_verified_sql(entity("g", sql="SELECT 1"))
+
+
+def test_verified_only_write_keeps_verified_prunes_unverified(tmp_path):
+    root = tmp_path / "corpus"
+    rows = [
+        entity(
+            "keep",
+            table="db.a",
+            sql="SELECT 1",
+            sql_process_properties=_wrapper({"is_verified": True}),
+        ),
+        entity(
+            "drop",
+            table="db.b",
+            sql="SELECT 2",
+            sql_process_properties=_wrapper({"is_verified": False}),
+        ),
+    ]
+    stats = write_corpus(rows, root, lock=False)
+    assert stats.written == 2
+    manifest = json.loads((root / ".history_sql_manifest.json").read_text())
+    assert manifest["verified_only"] is False
+
+    stats = write_corpus(rows, root, lock=False, verified_only=True)
+    assert stats.written == 1
+    assert (root / "A.sql").is_file()
+    assert not (root / "B.sql").exists()
+    assert ("drop", "skip:unverified") in stats.skipped
+    assert stats.pruned == ["B.sql"]
+    manifest = json.loads((root / ".history_sql_manifest.json").read_text())
+    assert manifest["verified_only"] is True
+
+
+def test_cli_verified_only_flag_filters_the_snapshot(tmp_path, monkeypatch, capsys):
+    destination = tmp_path / "snapshot"
+    rt = SimpleNamespace(
+        settings=SimpleNamespace(
+            plugins=SimpleNamespace(config={"de-agent": {"history_sql": {"enabled": True}}}),
+            semantic=object(),
+        ),
+        paths=SimpleNamespace(home=tmp_path),
+        redaction_secrets=(),
+    )
+    monkeypatch.setattr(cli, "prepare_runtime", lambda _: rt)
+
+    def respond(req):
+        rows = (
+            [
+                entity(
+                    "keep",
+                    table="db.a",
+                    sql="SELECT 1",
+                    sql_process_properties={"is_verified": True},
+                ),
+                entity(
+                    "drop",
+                    table="db.b",
+                    sql="SELECT 2",
+                    sql_process_properties={"is_verified": "false"},
+                ),
+            ]
+            if int(req.url.params["offset"]) == 0
+            else []
+        )
+        return httpx.Response(200, json={"entities": rows})
+
+    with SemanticServiceClient("http://semantic", transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(cli.SemanticServiceClient, "from_settings", lambda _: client)
+        assert (
+            dataagent_main(
+                [
+                    "history-sql",
+                    "--if-enabled",
+                    "--output-dir",
+                    str(destination),
+                    "--no-lock",
+                    "--verified-only",
+                ]
+            )
+            == 0
+        )
+    report = json.loads(capsys.readouterr().out)
+    assert report["written"] == 1
+    assert report["skipped"] == [["drop", "skip:unverified"]]
+    assert report["unrecognized_properties"] == 0
+    assert (destination / "A.sql").is_file()
+    assert not (destination / "B.sql").exists()
+
+
+def test_verified_state_classifies_annotation_shapes():
+    def with_props(props):
+        return entity("g", sql="SELECT 1", sql_process_properties=props)
+
+    assert _verified_state(with_props(_wrapper({"is_verified": True}))) == "verified"
+    assert _verified_state(with_props({"is_verified": "TRUE"})) == "verified"
+    assert _verified_state(with_props(_wrapper({"is_verified": False}))) == "unverified"
+    assert _verified_state(with_props({"is_verified": "false"})) == "unverified"
+    assert _verified_state(entity("g", sql="SELECT 1")) == "unverified"  # 列缺失
+    # 包装形显式 NULL = 无标注（正常态），不算形态漂移
+    assert (
+        _verified_state(with_props({"type": "jsonb", "value": None, "null": True})) == "unverified"
+    )
+    # 有值但读不出 = 形态不可辨（疑似服务端字段漂移）
+    assert (
+        _verified_state(with_props({"type": "jsonb", "value": "not json", "null": False}))
+        == "unrecognized"
+    )
+    assert _verified_state(with_props(json.dumps([1, 2]))) == "unrecognized"
+    assert _verified_state(with_props(123)) == "unrecognized"
+    # 服务端未来若把已解析对象直接装进包装 value，同样计为不可辨（可见而非静默）
+    assert (
+        _verified_state(
+            with_props({"type": "jsonb", "value": {"is_verified": True}, "null": False})
+        )
+        == "unrecognized"
+    )
+
+
+def test_verified_only_counts_unreadable_shapes_without_changing_membership(tmp_path):
+    rows = [
+        entity(
+            "keep",
+            table="db.a",
+            sql="SELECT 1",
+            sql_process_properties=_wrapper({"is_verified": True}),
+        ),
+        entity(
+            "explicit",
+            table="db.b",
+            sql="SELECT 2",
+            sql_process_properties=_wrapper({"is_verified": False}),
+        ),
+        entity(
+            "drift",
+            table="db.c",
+            sql="SELECT 3",
+            sql_process_properties={"type": "jsonb", "value": "not json", "null": False},
+        ),
+    ]
+    stats = write_corpus(rows, tmp_path / "corpus", lock=False, verified_only=True)
+    assert stats.written == 1
+    assert (tmp_path / "corpus" / "A.sql").is_file()
+    assert not (tmp_path / "corpus" / "B.sql").exists()
+    assert not (tmp_path / "corpus" / "C.sql").exists()
+    assert stats.unrecognized_properties == 1  # 漂移条目计数；成员判定不变（照旧排除）
+    assert ("explicit", "skip:unverified") in stats.skipped
+    assert ("drift", "skip:unverified") in stats.skipped
+
+    full = write_corpus(rows, tmp_path / "full", lock=False)  # 默认模式不感知标注形态
+    assert full.written == 3
+    assert full.unrecognized_properties == 0

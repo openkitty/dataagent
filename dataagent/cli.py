@@ -136,6 +136,12 @@ def _parser() -> argparse.ArgumentParser:
     history.add_argument(
         "--no-lock", action="store_true", help="Do not chmod the prepared snapshot read-only"
     )
+    history.add_argument(
+        "--verified-only",
+        action="store_true",
+        help="Write only SQL whose sql_process_properties marks is_verified true; "
+        "previously written unverified files are pruned",
+    )
     return parser
 
 
