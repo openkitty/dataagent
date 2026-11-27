@@ -22,6 +22,12 @@ member), scheduler ``$`` placeholders stripped (``temp.x_$date`` ->
 sql_id name part (``GET_DATA_..._START_<hash>`` -> ``GET_DATA_..._START.sql``).
 The manifest (with per-file sha256) protects pruning: files are only removed
 on refresh when a previous manifest proves the directory is downloader-managed.
+
+With ``--verified-only`` only records whose ``sql_process_properties`` marks
+``is_verified`` true are written; the jsonb attribute arrives wrapped as a
+PGobject bean ({"type": "jsonb", "value": ...}) and is unwrapped locally.
+A refresh into a manifest-managed directory prunes previously written
+unverified files, so the retrieval corpus narrows to verified SQL only.
 """
 
 from __future__ import annotations
@@ -89,6 +95,7 @@ class CorpusWriteStats:
     total_fetched: int = 0
     duplicates_skipped: int = 0
     pages: int = 0
+    unrecognized_properties: int = 0
     skipped: list[tuple[str, str]] = field(default_factory=list)
     pruned: list[str] = field(default_factory=list)
     output_dir: str = ""
@@ -201,6 +208,76 @@ def _sql_record_name(attributes: dict[str, Any]) -> str | None:
     return sql_id.strip()
 
 
+def _unwrap_jsonb(raw: Any) -> dict[str, Any] | None:
+    """Unwrap a jsonb attribute arriving through the entity read path.
+
+    The semantic service serializes jsonb columns as a PGobject bean
+    ({"type": "jsonb", "value": "<json text>", "null": false}); a plain
+    dict is passed through as-is (future-proof for a server-side unwrap),
+    and a bare JSON string is parsed leniently. Returns None for null /
+    missing / unparsable values so callers treat them as "not verified".
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        keys = set(raw)
+        if raw.get("type") == "jsonb" and keys <= {"type", "value", "null"}:
+            value = raw.get("value")
+            if not isinstance(value, str):
+                return None
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                return None
+            return parsed if isinstance(parsed, dict) else None
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+_VERIFIED = "verified"
+_UNVERIFIED = "unverified"
+_UNRECOGNIZED = "unrecognized"
+
+
+def _verified_state(entity: dict[str, Any]) -> str:
+    """Classify one record for the verified-only filter (membership unchanged).
+
+    Three outcomes the boolean filter historically conflated: ``verified``
+    (annotation readable and strictly true), ``unverified`` (annotation
+    readable and explicitly not true, or column absent/null - the normal
+    no-annotation state), and ``unrecognized`` (the field has a value whose
+    shape cannot be parsed - a probable server-side format drift). Only
+    ``verified`` enters the corpus; ``unrecognized`` is counted in stats and
+    warned, so silent shape drift becomes visible instead of masquerading
+    as "no annotations".
+    """
+    attributes = entity.get("attributes")
+    attributes = attributes if isinstance(attributes, dict) else {}
+    raw = attributes.get("sql_process_properties")
+    if raw is None:
+        return _UNVERIFIED
+    if isinstance(raw, dict) and raw.get("value") is None and raw.get("null") is True:
+        return _UNVERIFIED  # wrapper form of an explicit NULL
+    props = _unwrap_jsonb(raw)
+    if not isinstance(props, dict):
+        return _UNRECOGNIZED  # value present but unreadable
+    value = props.get("is_verified")
+    if value is True or (isinstance(value, str) and value.strip().lower() == "true"):
+        return _VERIFIED
+    return _UNVERIFIED
+
+
+def _is_verified_sql(entity: dict[str, Any]) -> bool:
+    """Backward-compatible boolean view: True only for strictly verified records."""
+    return _verified_state(entity) == _VERIFIED
+
+
 def derive_output_table(entity: dict[str, Any]) -> tuple[str | None, str]:
     """Return (table, outcome); outcome is "target" | "fallback" | "skip:<reason>".
 
@@ -282,8 +359,14 @@ def write_corpus(
     *,
     lock: bool = True,
     source_base_url: str = "",
+    verified_only: bool = False,
 ) -> CorpusWriteStats:
-    """Materialize the corpus: unlock -> write -> manifest-prune -> manifest -> lock."""
+    """Materialize the corpus: unlock -> write -> manifest-prune -> manifest -> lock.
+
+    With ``verified_only`` only records whose ``sql_process_properties`` marks
+    ``is_verified`` true are written; the rest become ``skip:unverified`` and,
+    on a refresh, their previously written files are pruned.
+    """
     output_dir = Path(output_dir)
     if output_dir.is_symlink():
         raise CorpusDownloadError("Corpus directory must not be a symlink")
@@ -308,6 +391,13 @@ def write_corpus(
     derived: list[tuple[dict[str, Any], str, str]] = []
     base_counts: Counter[str] = Counter()
     for entity in ordered:
+        if verified_only:
+            state = _verified_state(entity)
+            if state != _VERIFIED:
+                if state == _UNRECOGNIZED:
+                    stats.unrecognized_properties += 1
+                stats.skipped.append((str(entity.get("guid") or "?"), "skip:unverified"))
+                continue
         table, outcome = derive_output_table(entity)
         if table is None:
             stats.skipped.append((str(entity.get("guid") or "?"), outcome))
@@ -320,6 +410,13 @@ def write_corpus(
         derived.append((entity, table, outcome))
         base_counts[_base_name(table)] += 1
 
+    if stats.unrecognized_properties:
+        logger.warning(
+            "history_sql_downloader: %d records carry unreadable sql_process_properties "
+            "shapes (possible server field drift); they were excluded from the "
+            "verified corpus",
+            stats.unrecognized_properties,
+        )
     _unlock_tree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -356,7 +453,7 @@ def write_corpus(
                         f"Refusing to overwrite unmanaged or modified SQL: {name}"
                     )
             tmp_path = output_dir / f".{name}.tmp"
-            tmp_path.write_text(content, encoding="utf-8")
+            tmp_path.write_text(content, encoding="utf-8", newline="\n")
             os.replace(tmp_path, output_dir / name)
             manifest_files.append(
                 {"file": name, "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()}
@@ -383,6 +480,7 @@ def write_corpus(
         manifest = {
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "source": source_base_url,
+            "verified_only": bool(verified_only),
             "files": manifest_files,
         }
         temporary = output_dir / ".history_sql_manifest.tmp"

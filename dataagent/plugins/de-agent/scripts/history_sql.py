@@ -48,7 +48,11 @@ def run(args: argparse.Namespace) -> int:
         with SemanticServiceClient.from_settings(runtime.settings.semantic) as client:
             result = fetch_all_entities(client, page_size=args.page_size)
             stats = write_corpus(
-                result.entities, destination, lock=not args.no_lock, source_base_url=client.base_url
+                result.entities,
+                destination,
+                lock=not args.no_lock,
+                source_base_url=client.base_url,
+                verified_only=args.verified_only,
             )
         stats.total_fetched = len(result.entities)
         stats.pages = result.pages
